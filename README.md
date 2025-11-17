@@ -29,6 +29,14 @@ This application combines multiple tools into one central hub:
 | :---: | :---: |
 | ![Dashboard Page](dashboard.png) | ![About Page](about.png) |
 
+### 🔐 Admin Access
+
+The **Accounting** and **Sales Commission** sections are protected to secure your financial data.
+
+* **Default Password:** `admin123`
+
+*(Note: This password is hard-coded in the application for v1.0.0. In a future version, this should be changeable.)*
+
 ## Credits
 
 * **Developer:** [ash4code](https://github.com/ash4code)
