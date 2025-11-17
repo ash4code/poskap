@@ -993,7 +993,11 @@ class HistoryPage(ttk.Frame):
         
         cols = ("order_no", "party_name", "creation_date", "last_saved", "status"); self.tree = ttk.Treeview(self, columns=cols, show="headings")
         for col in cols: self.tree.heading(col, text=col.replace('_', ' ').title())
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10)); self.refresh_orders()
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        self.tree.tag_configure('Current', background='#F8D7DA', foreground='#721C24')  # Red
+        self.tree.tag_configure('Sended', background='#D4EDDA', foreground='#155724')  # Green
+        self.refresh_orders()
 
     def refresh_orders(self, data=None):
         if hasattr(self, 'part_no_search_var'):
@@ -1005,11 +1009,24 @@ class HistoryPage(ttk.Frame):
             order_list = self.db.get_all_orders()
         else:
             order_list = data
-            
+
         for order in order_list:
             formatted = list(order)
-            if formatted[3] is None: formatted[3] = formatted[2]
-            self.tree.insert("", tk.END, values=formatted)
+            if formatted[3] is None: formatted[3] = formatted[2]  # Keep this logic
+
+            # --- NEW: Determine row tag based on status ---
+            # Status is at index 4 in the 'order' tuple
+            status = order[4]
+            row_tag = ''
+
+            if status == 'Current':
+                row_tag = 'Current'
+            elif status == 'Sended':
+                row_tag = 'Sended'
+            # --- END NEW ---
+
+            # Insert the row with the new tag
+            self.tree.insert("", tk.END, values=formatted, tags=(row_tag,))
 
     def edit_order(self):
         if not self.tree.selection(): messagebox.showwarning("No Selection", "Please select an order."); return
