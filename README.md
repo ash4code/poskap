@@ -9,9 +9,7 @@ A standalone Point of Sale (POS) and shop management system built with Python an
 
 ## 📥 Download
 
-The latest standalone Windows application (**no installation required**) can be downloaded from our **[Releases Page](https://github.com/ash4code/KabirAutoPOS/releases/latest)**.
-
-*(Note: This link assumes your GitHub repository is named `ash4code/KabirAutoPOS`. Please update it if your username or repository name is different!)*
+The latest standalone Windows application (**no installation required**) can be downloaded from our **[Releases Page](https://github.com/ash4code/poskap/releases/latest)**.
 
 ## ✨ Key Features
 
@@ -49,8 +47,8 @@ If you want to run the application from the source code:
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/ash4code/KabirAutoPOS.git](https://github.com/ash4code/KabirAutoPOS.git)
-    cd KabirAutoPOS
+    git clone [https://github.com/ash4code/poskap.git](https://github.com/ash4code/poskap.git)
+    cd poskap
     ```
 
 2.  **Create and activate a virtual environment:**
