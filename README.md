@@ -1,4 +1,4 @@
-# Kabir Auto Parts - POS (v1.0.0)
+# Kabir Auto Parts - POS (v1.0.1)
 
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/ash4code/KabirAutoPOS?label=latest%20release)](https://github.com/ash4code/KabirAutoPOS/releases/latest)
