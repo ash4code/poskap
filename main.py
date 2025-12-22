@@ -84,7 +84,7 @@ class Database:
         """Creates or alters tables to match the new schema."""
         # --- Standard Order Tables ---
         self.cursor.execute("CREATE TABLE IF NOT EXISTS parties (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL)")
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, part_number TEXT, price REAL)")
+        self.cursor.execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, part_number TEXT, price REAL)")
         self.cursor.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, order_number TEXT UNIQUE, party_id INTEGER, order_date TEXT, status TEXT, total_amount REAL, last_saved_date TEXT, FOREIGN KEY (party_id) REFERENCES parties (id))")
         self.cursor.execute("CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY, order_id INTEGER, item_id INTEGER, quantity INTEGER, unit_price REAL, vehicle TEXT, brand TEXT, FOREIGN KEY (order_id) REFERENCES orders (id), FOREIGN KEY (item_id) REFERENCES items (id))")
 
@@ -401,23 +401,30 @@ class Database:
     def get_suggestions(self, table, query):
         self.cursor.execute(f"SELECT name FROM {table} WHERE name LIKE ?", (f'%{query}%',)); return [row[0] for row in self.cursor.fetchall()]
 
-    def get_item_details(self, name):
-        self.cursor.execute("SELECT part_number, price FROM items WHERE name=?", (name,)); return self.cursor.fetchone() or ('', 0.0)
-
     def get_or_create_id(self, table, name, details=None):
-        self.cursor.execute(f"SELECT id FROM {table} WHERE name=?", (name,))
+        # If we are saving an item, check BOTH name AND part number
+        if table == 'items' and details:
+            part_no = details.get('part_number', '')
+            self.cursor.execute("SELECT id FROM items WHERE name=? AND part_number=?", (name, part_no))
+        else:
+            # For parties, just matching name is fine
+            self.cursor.execute(f"SELECT id FROM {table} WHERE name=?", (name,))
+
         result = self.cursor.fetchone()
+
         if result:
-            if table == 'items' and details and details.get('part_number'):
-                self.cursor.execute("UPDATE items SET part_number=? WHERE id=?", (details['part_number'], result[0])); self.conn.commit()
+            # Returns ID only if BOTH name and part number match exactly
             return result[0]
         else:
+            # Create a new entry if that specific combination doesn't exist
             if details is None: details = {}
             if table == 'parties':
                 self.cursor.execute("INSERT INTO parties (name) VALUES (?)", (name,))
             elif table == 'items':
-                self.cursor.execute("INSERT INTO items (name, part_number, price) VALUES (?, ?, ?)", (name, details.get('part_number', ''), details.get('price', 0.0)))
-            self.conn.commit(); return self.cursor.lastrowid
+                self.cursor.execute("INSERT INTO items (name, part_number, price) VALUES (?, ?, ?)",
+                                    (name, details.get('part_number', ''), details.get('price', 0.0)))
+            self.conn.commit()
+            return self.cursor.lastrowid
 
     def get_party_id_by_name(self, name):
         self.cursor.execute("SELECT id FROM parties WHERE name=?", (name,)); result = self.cursor.fetchone(); return result[0] if result else None
@@ -684,7 +691,7 @@ class OrderPage(ttk.Frame):
         # --- Item Name ---
         ttk.Label(self.item_frame, text="Item Name:").grid(row=0, column=0, sticky=tk.W, padx=(5, 2))
         self.item_name_var = tk.StringVar()
-        self.item_name_entry = AutocompleteEntry(self.item_frame, 'items', self.db, textvariable=self.item_name_var)
+        self.item_name_entry = ttk.Entry(self.item_frame, textvariable=self.item_name_var)
         self.item_name_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 15))  # <-- No .trace()
 
         # --- Part No ---
@@ -813,7 +820,7 @@ class OrderPage(ttk.Frame):
             messagebox.showwarning("Invalid Input", "Please enter item name and positive quantity.")
             return
 
-        _, price = self.db.get_item_details(name)
+        price = 0.0
         self.items_in_order.append({'name': name, 'part_no': part_no, 'qty': qty, 'price': price})
         self.refresh_bill_treeview(); self.clear_item_fields()
 
@@ -895,7 +902,7 @@ class NonOEMOrderPage(OrderPage):
 
         ttk.Label(self.item_frame, text="Item:").grid(row=0, column=0, padx=(5, 2), pady=2)
         self.item_name_var = tk.StringVar();
-        self.item_name_entry = AutocompleteEntry(self.item_frame, 'items', self.db, textvariable=self.item_name_var)
+        self.item_name_entry = ttk.Entry(self.item_frame, textvariable=self.item_name_var)
         self.item_name_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 10))  # <-- No .trace()
 
         ttk.Label(self.item_frame, text="Part No:").grid(row=0, column=2, padx=(5, 2), pady=2)
@@ -955,7 +962,7 @@ class NonOEMOrderPage(OrderPage):
         try: qty = self.item_qty_var.get()
         except tk.TclError: qty = 0
         if not name or qty <= 0: messagebox.showwarning("Invalid Input", "Please enter item name and positive quantity."); return
-        _, price = self.db.get_item_details(name)
+        price =0.0
         self.items_in_order.append({'name': name, 'part_no': part_no, 'qty': qty, 'price': price, 'vehicle': vehicle, 'brand': brand})
         self.refresh_bill_treeview(); self.clear_item_fields()
 
@@ -3050,7 +3057,7 @@ class App(tk.Tk):
         super().__init__()
         self.db = db
         self.db_path = db_path
-        self.version = "v1.0.0"
+        self.version = "v1.0.1"
         self.after_idle(self._configure_window)
         self.PASSWORD = "admin123"
         self.accounting_unlocked = False
