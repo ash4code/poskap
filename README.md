@@ -1,7 +1,7 @@
 # Kabir Auto Parts - POS (v1.0.1)
 
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Latest Release](https://img.shields.io/github/v/release/ash4code/KabirAutoPOS?label=latest%20release)](https://github.com/ash4code/KabirAutoPOS/releases)
+[![Latest Release](https://img.shields.io/github/v/release/ash4code/KabirAutoPOS?label=latest%20release)]([https://github.com/ash4code/KabirAutoPOS/releases](https://github.com/ash4code/poskap/releases/latest))
 
 A standalone Point of Sale (POS) and shop management system built with Python and tkinter. This application is custom-built for Kabir Auto Parts to manage orders, invoicing, part requests, and sales commissions in one simple-to-use desktop tool.
 
