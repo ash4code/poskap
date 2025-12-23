@@ -83,9 +83,9 @@ class Database:
     def _create_tables(self):
         """Creates or alters tables to match the new schema."""
         # --- Standard Order Tables ---
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS parties (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL)")
+        self.cursor.execute("CREATE TABLE IF NOT EXISTS parties (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         self.cursor.execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, part_number TEXT, price REAL)")
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, order_number TEXT UNIQUE, party_id INTEGER, order_date TEXT, status TEXT, total_amount REAL, last_saved_date TEXT, FOREIGN KEY (party_id) REFERENCES parties (id))")
+        self.cursor.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, order_number TEXT , party_id INTEGER, order_date TEXT, status TEXT, total_amount REAL, last_saved_date TEXT, FOREIGN KEY (party_id) REFERENCES parties (id))")
         self.cursor.execute("CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY, order_id INTEGER, item_id INTEGER, quantity INTEGER, unit_price REAL, vehicle TEXT, brand TEXT, FOREIGN KEY (order_id) REFERENCES orders (id), FOREIGN KEY (item_id) REFERENCES items (id))")
 
         # --- Accounting Tables ---
@@ -3158,18 +3158,13 @@ class App(tk.Tk):
         except tk.TclError as e:
             print(f"Warning: Could not load icon '{icon_path}': {e}")
         # --- END OF BLOCK ---
+
+
 if __name__ == "__main__":
     # --- Define a persistent location for the database ---
     APP_NAME = "KabirAutoPOS"
-    # Use AppData folder (common for application data)
     persistent_folder = os.path.join(os.getenv('APPDATA'), APP_NAME)
-    # Or uncomment below to use Documents folder (more visible to user)
-    # persistent_folder = os.path.join(os.path.expanduser('~'), 'Documents', APP_NAME)
-
-    # Ensure the persistent folder exists
     os.makedirs(persistent_folder, exist_ok=True)
-
-    # Define the path to the database in the persistent folder
     persistent_db_path = os.path.join(persistent_folder, "database.db")
 
     # --- Check if the persistent database exists ---
@@ -3177,19 +3172,33 @@ if __name__ == "__main__":
         try:
             # Find the path to the bundled database (using resource_path)
             bundled_db_path = resource_path("database.db")
-            # Copy the bundled database to the persistent location (first run only)
-            shutil.copyfile(bundled_db_path, persistent_db_path)
-            print(f"Database copied to: {persistent_db_path}")
+
+            # --- NEW CHECK: Only copy if the file actually exists ---
+            if os.path.exists(bundled_db_path):
+                shutil.copyfile(bundled_db_path, persistent_db_path)
+                print(f"Database copied to: {persistent_db_path}")
+            else:
+                print("No bundled database found. A fresh, empty database will be created automatically.")
+
         except Exception as e:
-            # Show critical error if copy fails
-            root = tk.Tk()
-            root.withdraw() # Hide the main window
-            messagebox.showerror(
-                "Fatal Error",
-                f"Could not create or copy the database to '{persistent_folder}'.\n"
-                f"Please check permissions.\n\nError: {e}"
-            )
-            sys.exit(1) # Exit if we can't set up the DB
+            # If copying fails, just print a warning and continue. Don't crash.
+            print(f"Warning: Could not copy bundled DB ({e}). Continuing with fresh DB.")
+
+    # --- Always use the persistent database path ---
+    try:
+        # Pass the PERSISTENT path to the Database and App classes
+        db_instance = Database(persistent_db_path)
+        app = App(db_instance, persistent_db_path)
+        app.mainloop()
+    except Exception as e:
+        # General error handling during app startup
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Application Error",
+            f"An unexpected error occurred during startup:\n{e}"
+        )
+        sys.exit(1)
 
     # --- Always use the persistent database path ---
     try:
