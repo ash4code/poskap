@@ -3199,20 +3199,3 @@ if __name__ == "__main__":
             f"An unexpected error occurred during startup:\n{e}"
         )
         sys.exit(1)
-
-    # --- Always use the persistent database path ---
-    try:
-        # Pass the PERSISTENT path to the Database and App classes
-        db_instance = Database(persistent_db_path)
-        app = App(db_instance, persistent_db_path)
-        app.mainloop()
-    except Exception as e:
-         # General error handling during app startup
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror(
-                "Application Error",
-                f"An unexpected error occurred during startup:\n{e}"
-            )
-            sys.exit(1)
-
