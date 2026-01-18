@@ -33,12 +33,19 @@ active_driver = None
 automation_process = None
 
 # --- LOCATE DRIVER ---
-if getattr(sys, 'frozen', False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# --- LOCATE DRIVER ---
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        # Not bundled, use the script's directory
+        base_path = os.path.abspath(os.path.dirname(__file__))
+    return os.path.join(base_path, relative_path)
 
-DRIVER_PATH = os.path.join(BASE_DIR, "msedgedriver.exe")
+# Correctly locate driver whether in PyCharm or as an EXE
+DRIVER_PATH = resource_path("msedgedriver.exe")
 
 def find_edge_executable():
     possible_paths = [
