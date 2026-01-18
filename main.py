@@ -8,6 +8,49 @@ from xml.sax.saxutils import escape
 import os
 import sys 
 import shutil
+import threading
+import queue
+import subprocess
+import time
+import urllib3
+
+# --- Selenium Imports ---
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.edge.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- SCRAPER CONFIGURATION ---
+TARGET_URL = "https://ecatalogue.heromotocorp.biz:8080/Hero/"
+TEMP_PROFILE_DIR = r"C:\selenium\HeroEdgeProfile"
+gui_queue = queue.Queue()
+active_driver = None
+automation_process = None
+
+# --- LOCATE DRIVER ---
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DRIVER_PATH = os.path.join(BASE_DIR, "msedgedriver.exe")
+
+def find_edge_executable():
+    possible_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe")
+    ]
+    for path in possible_paths:
+        if os.path.exists(path): return path
+    return None
+BROWSER_EXE = find_edge_executable()
+
 
 # --- Calendar Widget (Requires 'pip install tkcalendar') ---
 try:
@@ -16,7 +59,13 @@ try:
 except ImportError:
     CALENDAR_ENABLED = False  # <--- THIS IS HAPPENING
 
-# --- PDF Generation (Requires 'pip install reportlab') ---
+# --- EXISTING IMPORTS (Calendar, ReportLab, etc) ---
+try:
+    from tkcalendar import DateEntry
+    CALENDAR_ENABLED = True
+except ImportError:
+    CALENDAR_ENABLED = False
+
 try:
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -24,30 +73,16 @@ try:
     from reportlab.lib.pagesizes import letter, A4
     from reportlab.lib.units import inch
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
-    from reportlab.pdfbase import pdfmetrics
     PDF_ENABLED = True
-except ImportError as e:
-    print("!!!!!!!!!!! PDF IMPORT FAILED !!!!!!!!!!!")
-    print(f"The error is: {e}")
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    PDF_ENABLED = False
-
-# --- Calendar Widget (Requires 'pip install tkcalendar') ---
-try:
-    from tkcalendar import DateEntry
-    CALENDAR_ENABLED = True
 except ImportError:
-    CALENDAR_ENABLED = False
+    PDF_ENABLED = False
 
 # --- NEW: XLSX Generation (Requires 'pip install openpyxl') ---
 try:
     import openpyxl
-    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+    from openpyxl.styles import Font, Alignment, PatternFill
     XLSX_ENABLED = True
-except ImportError as e:
-    print("!!!!!!!!!!! XLSX IMPORT FAILED !!!!!!!!!!!")
-    print(f"The error is: {e}")
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+except ImportError:
     XLSX_ENABLED = False
 # --- END NEW ---
 
@@ -71,6 +106,153 @@ def resource_path(relative_path):
         base_path = os.path.abspath(os.path.dirname(sys.argv[0]))    
     return os.path.join(base_path, relative_path)
 
+
+# --- THREAD 1: INITIALIZATION (Auto-Start) ---
+def init_browser_thread():
+    global automation_process, active_driver
+    gui_queue.put(("status", "Checking System..."))
+
+    if not os.path.exists(DRIVER_PATH):
+        gui_queue.put(("error", f"Driver missing!\nPut 'msedgedriver.exe' here:\n{BASE_DIR}"))
+        return
+
+    service = Service(executable_path=DRIVER_PATH)
+    edge_options = Options()
+    edge_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+
+    # 1. CHECK FOR EXISTING BROWSER
+    try:
+        driver = webdriver.Edge(service=service, options=edge_options)
+        gui_queue.put(("light", "green"))
+        gui_queue.put(("status", "System Ready (Instant)"))
+        return
+    except:
+        pass
+
+        # 2. LAUNCH INVISIBLE BROWSER
+    gui_queue.put(("status", "Starting Service..."))
+
+    if os.path.exists(TEMP_PROFILE_DIR):
+        try:
+            shutil.rmtree(TEMP_PROFILE_DIR)
+        except:
+            pass
+
+    cmd = [
+        BROWSER_EXE, "--remote-debugging-port=9222", f"--user-data-dir={TEMP_PROFILE_DIR}",
+        "--no-first-run", "--no-default-browser-check", "--ignore-certificate-errors",
+        "--headless=new", "--disable-gpu", "--window-size=1920,1080",
+        "--proxy-bypass-list=<-loopback>", TARGET_URL
+    ]
+
+    try:
+        automation_process = subprocess.Popen(cmd, creationflags=0x08000000)
+    except:
+        automation_process = subprocess.Popen(cmd)
+
+    # 3. CONNECTION LOOP
+    connected = False
+    for i in range(30):
+        try:
+            driver = webdriver.Edge(service=service, options=edge_options)
+            connected = True
+            break
+        except:
+            time.sleep(1)
+
+    if not connected:
+        gui_queue.put(("error", "Could not connect. Restart App."))
+        return
+
+    # 4. STABILIZATION
+    gui_queue.put(("light", "orange"))
+    for i in range(15, 0, -1):
+        gui_queue.put(("status", f"Stabilizing... {i}s"))
+        time.sleep(1)
+
+    gui_queue.put(("light", "green"))
+    gui_queue.put(("status", "System Ready"))
+
+
+# --- THREAD 2: SEARCH ---
+def search_thread(part_number):
+    global active_driver
+    try:
+        service = Service(executable_path=DRIVER_PATH)
+        edge_options = Options()
+        edge_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+
+        gui_queue.put(("status", "Processing..."))
+
+        try:
+            driver = webdriver.Edge(service=service, options=edge_options)
+            active_driver = driver
+        except Exception as e:
+            gui_queue.put(("error", "Connection Lost. Restart App."))
+            gui_queue.put(("light", "red"))
+            return
+
+        if "heromotocorp" not in driver.current_url:
+            driver.get(TARGET_URL)
+
+        # Remove Popup
+        try:
+            driver.execute_script("""
+                var banner = document.querySelector('.cc-window');
+                if (banner) { banner.remove(); }
+                var buttons = document.getElementsByTagName('button');
+                for (var i = 0; i < buttons.length; i++) {
+                    if (buttons[i].textContent.includes('I Understand')) { buttons[i].click(); }
+                }
+            """)
+        except:
+            pass
+
+        # Search
+        try:
+            WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.ID, "ppartno")))
+        except:
+            gui_queue.put(("error", "Page not loaded."))
+            return
+
+        part_input = driver.find_element(By.ID, "ppartno")
+        part_input.clear()
+        part_input.send_keys(part_number)
+
+        search_btn = driver.find_element(By.ID, "pbtn")
+        driver.execute_script("arguments[0].click();", search_btn)
+
+        # Scrape
+        try:
+            WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.ID, "datatableoldpart")))
+        except:
+            gui_queue.put(("not_found", "No results found."))
+            return
+
+        try:
+            table = driver.find_element(By.ID, "datatableoldpart")
+            rows = table.find_elements(By.TAG_NAME, "tr")
+
+            if len(rows) < 2:
+                gui_queue.put(("not_found", "Part not found."))
+                return
+
+            cols = rows[1].find_elements(By.TAG_NAME, "td")
+            # Extract Data
+            data = {
+                "Part No": cols[1].text if len(cols) > 1 else "-",
+                "Description": cols[3].text if len(cols) > 3 else "-",
+                "MOQ": cols[5].text if len(cols) > 5 else "-",
+                "Price": cols[6].text if len(cols) > 6 else "-"
+            }
+            gui_queue.put(("success", data))
+
+        except Exception as e:
+            gui_queue.put(("error", f"Read Error: {e}"))
+
+    except Exception as e:
+        gui_queue.put(("error", f"Error: {e}"))
+
 class Database:
     """Handles all database operations for the order system."""
     def __init__(self, db_file):
@@ -86,7 +268,7 @@ class Database:
         self.cursor.execute("CREATE TABLE IF NOT EXISTS parties (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         self.cursor.execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, part_number TEXT, price REAL)")
         self.cursor.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, order_number TEXT , party_id INTEGER, order_date TEXT, status TEXT, total_amount REAL, last_saved_date TEXT, FOREIGN KEY (party_id) REFERENCES parties (id))")
-        self.cursor.execute("CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY, order_id INTEGER, item_id INTEGER, quantity INTEGER, unit_price REAL, vehicle TEXT, brand TEXT, FOREIGN KEY (order_id) REFERENCES orders (id), FOREIGN KEY (item_id) REFERENCES items (id))")
+        self.cursor.execute("CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY, order_id INTEGER, item_id INTEGER, quantity INTEGER, unit_price REAL, vehicle TEXT, brand TEXT, moq TEXT, dlp REAL, FOREIGN KEY (order_id) REFERENCES orders (id), FOREIGN KEY (item_id) REFERENCES items (id))")
 
         # --- Accounting Tables ---
         self.cursor.execute("CREATE TABLE IF NOT EXISTS accounting_companies (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL)")
@@ -129,9 +311,16 @@ class Database:
         # Add columns if they don't exist for backward compatibility
         try:
             self.cursor.execute("ALTER TABLE items ADD COLUMN part_number TEXT")
-            self.cursor.execute("ALTER TABLE orders ADD COLUMN order_number TEXT UNIQUE"); self.cursor.execute("ALTER TABLE orders ADD COLUMN status TEXT"); self.cursor.execute("ALTER TABLE orders ADD COLUMN last_saved_date TEXT")
-            self.cursor.execute("ALTER TABLE order_items ADD COLUMN vehicle TEXT"); self.cursor.execute("ALTER TABLE order_items ADD COLUMN brand TEXT")
-        except sqlite3.OperationalError: pass
+            self.cursor.execute("ALTER TABLE orders ADD COLUMN order_number TEXT UNIQUE");
+            self.cursor.execute("ALTER TABLE orders ADD COLUMN status TEXT");
+            self.cursor.execute("ALTER TABLE orders ADD COLUMN last_saved_date TEXT")
+            self.cursor.execute("ALTER TABLE order_items ADD COLUMN vehicle TEXT");
+            self.cursor.execute("ALTER TABLE order_items ADD COLUMN brand TEXT")
+            # --- NEW MIGRATIONS ---
+            self.cursor.execute("ALTER TABLE order_items ADD COLUMN moq TEXT")
+            self.cursor.execute("ALTER TABLE order_items ADD COLUMN dlp REAL")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
         
     def get_company_summary_by_month(self, month_str, year_str):
@@ -439,8 +628,9 @@ class Database:
         self.cursor.execute("SELECT id, order_number FROM orders WHERE party_id = ? AND status = 'Current' LIMIT 1", (party_id,)); return self.cursor.fetchone()
 
     def get_order_items(self, order_id):
-        sql = "SELECT i.name, i.part_number, oi.quantity, oi.unit_price, oi.vehicle, oi.brand FROM order_items oi JOIN items i ON oi.item_id = i.id WHERE oi.order_id = ?"
-        self.cursor.execute(sql, (order_id,)); return self.cursor.fetchall()
+        sql = "SELECT i.name, i.part_number, oi.quantity, oi.unit_price, oi.vehicle, oi.brand, oi.moq, oi.dlp FROM order_items oi JOIN items i ON oi.item_id = i.id WHERE oi.order_id = ?"
+        self.cursor.execute(sql, (order_id,));
+        return self.cursor.fetchall()
 
     def save_or_update_order(self, order_id, party_id, total_amount, items_data, status, pregen_order_number=None):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S"); update_items = (status == 'Current')
@@ -448,14 +638,18 @@ class Database:
             self.cursor.execute("UPDATE orders SET last_saved_date=?, total_amount=?, status=? WHERE id=?", (now_str, total_amount, status, order_id))
             if update_items:
                 self.cursor.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
-                sql_items = "INSERT INTO order_items (order_id, item_id, quantity, unit_price, vehicle, brand) VALUES (?, ?, ?, ?, ?, ?)"
-                for item in items_data: self.cursor.execute(sql_items, (order_id, item['item_id'], item['quantity'], item['unit_price'], item.get('vehicle', ''), item.get('brand', '')))
+                # Modified Insert
+                sql_items = "INSERT INTO order_items (order_id, item_id, quantity, unit_price, vehicle, brand, moq, dlp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                for item in items_data:
+                    self.cursor.execute(sql_items, (order_id, item['item_id'], item['quantity'], item['unit_price'], item.get('vehicle', ''), item.get('brand', ''), item.get('moq', '-'), item.get('dlp', 0.0)))
         else:
             order_number = pregen_order_number or self.generate_order_number()
             self.cursor.execute("INSERT INTO orders (order_number, party_id, order_date, last_saved_date, total_amount, status) VALUES (?, ?, ?, ?, ?, ?)", (order_number, party_id, now_str, now_str, total_amount, status))
             order_id = self.cursor.lastrowid
-            sql_items = "INSERT INTO order_items (order_id, item_id, quantity, unit_price, vehicle, brand) VALUES (?, ?, ?, ?, ?, ?)"
-            for item in items_data: self.cursor.execute(sql_items, (order_id, item['item_id'], item['quantity'], item['unit_price'], item.get('vehicle', ''), item.get('brand', '')))
+            # Modified Insert
+            sql_items = "INSERT INTO order_items (order_id, item_id, quantity, unit_price, vehicle, brand, moq, dlp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            for item in items_data:
+                 self.cursor.execute(sql_items, (order_id, item['item_id'], item['quantity'], item['unit_price'], item.get('vehicle', ''), item.get('brand', ''), item.get('moq', '-'), item.get('dlp', 0.0)))
         self.conn.commit(); return order_id
 
     def get_all_orders(self):
@@ -662,99 +856,157 @@ def safe_float(value, default=0.0):
 # --- Application Pages ---
 class OrderPage(ttk.Frame):
     def __init__(self, parent, db, app):
-        super().__init__(parent); self.db = db; self.app = app; self.items_in_order = []; self.current_order_id = None; self.current_party_id = None; self.pending_order_number = None
+        super().__init__(parent);
+        self.db = db;
+        self.app = app
+        self.items_in_order = []
+        self.current_order_id = None;
+        self.current_party_id = None;
+        self.pending_order_number = None
         self._setup_widgets()
 
     def _setup_widgets(self):
-        page_controls = ttk.Frame(self, padding=(10, 10, 10, 0)); page_controls.pack(fill=tk.X)
+        page_controls = ttk.Frame(self, padding=(10, 10, 10, 0));
+        page_controls.pack(fill=tk.X)
         ttk.Button(page_controls, text="Start New Order", command=self.start_new_order).pack(side=tk.LEFT)
-        self.top_frame = ttk.Frame(self, padding=10); self.top_frame.pack(fill=tk.X)
-        party_frame = ttk.LabelFrame(self.top_frame, text="Party", padding=5); party_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+
+        self.top_frame = ttk.Frame(self, padding=10);
+        self.top_frame.pack(fill=tk.X)
+
+        # Simple Autocomplete Party
+        party_frame = ttk.LabelFrame(self.top_frame, text="Party", padding=5);
+        party_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         self.party_var = tk.StringVar()
         self.party_entry = AutocompleteEntry(party_frame, 'parties', self.db, textvariable=self.party_var, width=40)
         self.party_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(party_frame, text="Save", command=self.save_party).pack(side=tk.RIGHT, padx=(5, 0))
-        self.party_entry.bind("<Return>", self.load_party_data); self.party_entry.bind("<FocusOut>", self.load_party_data)
-        order_frame = ttk.LabelFrame(self.top_frame, text="Select Order", padding=5); order_frame.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        self.party_entry.bind("<Return>", self.load_party_data)
+        self.party_entry.bind("<FocusOut>", self.load_party_data)
+
+        order_frame = ttk.LabelFrame(self.top_frame, text="Select Order", padding=5);
+        order_frame.pack(side=tk.RIGHT, fill=tk.X, expand=True)
         self.order_var = tk.StringVar()
         self.order_combo = ttk.Combobox(order_frame, textvariable=self.order_var, state='readonly', width=30)
-        self.order_combo.pack(fill=tk.X, expand=True); self.order_combo.bind('<<ComboboxSelected>>', self.on_order_selected)
-        self._create_item_widgets(); self._create_bill_details_widgets()
+        self.order_combo.pack(fill=tk.X, expand=True);
+        self.order_combo.bind('<<ComboboxSelected>>', self.on_order_selected)
+
+        self._create_item_widgets();
+        self._create_bill_details_widgets()
 
     def _create_item_widgets(self):
-        self.item_frame = ttk.LabelFrame(self, text="Add Item to Order", padding=10);
+        self.item_frame = ttk.LabelFrame(self, text="Add Item", padding=10);
         self.item_frame.pack(fill=tk.X, padx=10, pady=5)
-        self.item_frame.columnconfigure(1, weight=3);
-        self.item_frame.columnconfigure(3, weight=2);
-        self.item_frame.columnconfigure(5, weight=1)
+        for i in range(12): self.item_frame.columnconfigure(i, weight=1)
 
-        # --- Item Name ---
-        ttk.Label(self.item_frame, text="Item Name:").grid(row=0, column=0, sticky=tk.W, padx=(5, 2))
-        self.item_name_var = tk.StringVar()
-        self.item_name_entry = ttk.Entry(self.item_frame, textvariable=self.item_name_var)
-        self.item_name_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 15))  # <-- No .trace()
-
-        # --- Part No ---
-        ttk.Label(self.item_frame, text="Part No:").grid(row=0, column=2, sticky=tk.W, padx=(5, 2))
+        ttk.Label(self.item_frame, text="Part No:").grid(row=0, column=0, sticky=tk.W)
         self.item_part_no_var = tk.StringVar()
-        self.part_no_entry = ttk.Entry(self.item_frame, textvariable=self.item_part_no_var)
-        self.part_no_entry.grid(row=0, column=3, sticky=tk.EW, padx=(0, 15))
+        self.item_part_no_var.trace("w", self._force_uppercase)
+        self.part_no_entry = ttk.Entry(self.item_frame, textvariable=self.item_part_no_var, width=15)
+        self.part_no_entry.grid(row=0, column=1, sticky=tk.EW, padx=2)
 
-        # --- Qty ---
-        ttk.Label(self.item_frame, text="Qty:").grid(row=0, column=4, sticky=tk.W, padx=(5, 2))
+        ttk.Label(self.item_frame, text="Qty:").grid(row=0, column=2, sticky=tk.W)
         self.item_qty_var = tk.IntVar(value=1)
-        self.qty_entry = ttk.Entry(self.item_frame, textvariable=self.item_qty_var, width=8)
-        self.qty_entry.grid(row=0, column=5, sticky=tk.W, padx=(0, 15))
+        self.qty_entry = ttk.Entry(self.item_frame, textvariable=self.item_qty_var, width=5)
+        self.qty_entry.grid(row=0, column=3, sticky=tk.EW, padx=2)
 
-        # --- Add Button ---
-        self.add_item_button = ttk.Button(self.item_frame, text="Add Item", command=self.add_item_to_order)
-        self.add_item_button.grid(row=0, column=6, padx=(5, 5))
+        ttk.Label(self.item_frame, text="Item Name:").grid(row=0, column=4, sticky=tk.W)
+        self.item_name_var = tk.StringVar()
+        self.item_name_entry = ttk.Entry(self.item_frame, textvariable=self.item_name_var, width=20)
+        self.item_name_entry.grid(row=0, column=5, sticky=tk.EW, padx=2)
 
-        # --- NEW BINDINGS for smooth entry ---
-        # Pressing Enter moves to the next field
-        self.item_name_entry.bind("<Return>", lambda event: self.part_no_entry.focus())
-        self.part_no_entry.bind("<Return>", lambda event: self.qty_entry.focus())
+        self.add_item_button = ttk.Button(self.item_frame, text="Add", command=self.add_item_to_order)
+        self.add_item_button.grid(row=0, column=6, padx=5)
 
-        # Pressing Enter on Qty adds the item
-        self.qty_entry.bind("<Return>", lambda event: self.add_item_to_order())
-        
+        self.part_no_entry.bind("<Return>", lambda e: self.qty_entry.focus())
+        self.qty_entry.bind("<Return>", lambda e: self.item_name_entry.focus())
+        self.item_name_entry.bind("<Return>", lambda e: self.add_item_to_order())
+
     def _create_bill_details_widgets(self):
-        order_frame = ttk.LabelFrame(self, text="Current Bill Details", padding=10); order_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        cols = ("sr_no", "item_name", "part_no", "qty")
-        self.tree = ttk.Treeview(order_frame, columns=cols, show="headings")
-        for col, text in {"sr_no": "Serial Number", "item_name": "Item Name", "part_no": "Part Number", "qty": "Quantity"}.items(): self.tree.heading(col, text=text)
-        for col, (w, a) in {"sr_no": (100, tk.CENTER), "item_name": (250, tk.W), "part_no": (150, tk.W), "qty": (100, tk.CENTER)}.items(): self.tree.column(col, width=w, anchor=a)
+        self.bill_list_frame = ttk.LabelFrame(self, text="Current Bill Details", padding=10);
+        self.bill_list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        cols = ("sr_no", "part_no", "item_name", "qty")
+        headers = {"sr_no": "SN", "part_no": "Part No", "qty": "Qty", "item_name": "Item Name"}
+        widths = {"sr_no": 40, "part_no": 120, "qty": 60, "item_name": 300}
+
+        self.tree = ttk.Treeview(self.bill_list_frame, columns=cols, show="headings")
         self.tree.pack(fill=tk.BOTH, expand=True)
-        total_frame = ttk.Frame(self, padding=10); total_frame.pack(fill=tk.X)
-        status_frame = ttk.Frame(total_frame); status_frame.pack(side=tk.LEFT)
-        ttk.Label(status_frame, text="Order Status:").pack(side=tk.LEFT, padx=(0, 5))
+        for col in cols:
+            self.tree.heading(col, text=headers[col])
+            self.tree.column(col, width=widths[col], anchor=tk.CENTER if col != "item_name" else tk.W)
+
+        total_frame = ttk.Frame(self, padding=10);
+        total_frame.pack(fill=tk.X)
+        status_frame = ttk.Frame(total_frame);
+        status_frame.pack(side=tk.LEFT)
+        ttk.Label(status_frame, text="Order Status:").pack(side=tk.LEFT)
         self.status_var = tk.StringVar()
-        self.status_combo = ttk.Combobox(status_frame, textvariable=self.status_var, values=['Current', 'Sended'], state='readonly')
-        self.status_combo.pack(side=tk.LEFT); self.status_combo.bind('<<ComboboxSelected>>', self.on_status_change)
-        self.save_button = ttk.Button(total_frame, text="Save Order", command=self.save_order); self.save_button.pack(side=tk.RIGHT, padx=2)
-        self.delete_item_button = ttk.Button(total_frame, text="Delete Selected Item", command=self.delete_selected_item); self.delete_item_button.pack(side=tk.RIGHT, padx=2)
+        self.status_combo = ttk.Combobox(status_frame, textvariable=self.status_var, values=['Current', 'Sended'],
+                                         state='readonly')
+        self.status_combo.pack(side=tk.LEFT, padx=5);
+        self.status_combo.bind('<<ComboboxSelected>>', self.on_status_change)
+
+        self.delete_item_button = ttk.Button(total_frame, text="Delete Selected", command=self.delete_selected_item)
+        self.delete_item_button.pack(side=tk.RIGHT, padx=2)
+        self.save_button = ttk.Button(total_frame, text="Save Order", command=self.save_order)
+        self.save_button.pack(side=tk.RIGHT, padx=2)
+
+    def _force_uppercase(self, *args):
+        val = self.item_part_no_var.get()
+        if val != val.upper(): self.item_part_no_var.set(val.upper())
+
+    def add_item_to_order(self):
+        name = self.item_name_var.get();
+        part_no = self.item_part_no_var.get().strip()
+        if self._check_duplicate_part_no(part_no): return
+        try:
+            qty = self.item_qty_var.get()
+        except:
+            qty = 0
+        if not name or qty <= 0: messagebox.showwarning("Input Error", "Enter Name and Quantity."); return
+
+        self.items_in_order.append({
+            'name': name, 'part_no': part_no, 'qty': qty,
+            'price': 0.0, 'vehicle': '', 'brand': '', 'moq': '-', 'dlp': 0.0
+        })
+        self.refresh_bill_treeview();
+        self.clear_item_fields();
+        self.part_no_entry.focus()
+
+    def refresh_bill_treeview(self):
+        for i in self.tree.get_children(): self.tree.delete(i)
+        for i, item in enumerate(self.items_in_order):
+            self.tree.insert("", tk.END, values=(i + 1, item['part_no'], item['name'], item['qty']))
 
     def start_new_order(self):
         if hasattr(self, 'party_entry'): self.party_entry.set_text_programmatically('')
-        self.order_var.set(''); self.order_combo['values'] = []; self.current_party_id = None; self.clear_bill_details()
-        if hasattr(self, 'party_entry'): self.party_entry.focus()
-        else: self.item_name_entry.focus()
+        self.order_var.set('');
+        self.order_combo['values'] = [];
+        self.current_party_id = None;
+        self.clear_bill_details();
+        if hasattr(self, 'party_entry'):
+            self.party_entry.focus()
+        else:
+            self.part_no_entry.focus()
 
     def save_party(self):
         party_name = self.party_var.get().strip()
-        if not party_name: messagebox.showwarning("Input Error", "Party name cannot be empty."); return
+        if not party_name: return
         self.current_party_id = self.db.get_or_create_id('parties', party_name)
-        messagebox.showinfo("Success", f"Party '{party_name}' has been saved."); self.load_party_data(force_reload=True)
+        messagebox.showinfo("Success", f"Party '{party_name}' saved.");
+        self.load_party_data(force_reload=True)
 
     def load_party_data(self, event=None, force_reload=False):
         party_name = self.party_var.get().strip() if hasattr(self, 'party_var') else "Non OEM"
         if not party_name:
-            if self.current_party_id is not None: self.current_party_id = None; self.clear_bill_details(); self.order_combo['values'] = []; self.order_var.set('')
+            if self.current_party_id is not None: self.current_party_id = None; self.clear_bill_details();
+            self.order_combo['values'] = [];
+            self.order_var.set('')
             return
         party_id = self.db.get_party_id_by_name(party_name)
         if party_id is None:
-            if self.current_party_id is not None: self.clear_bill_details(); self.order_combo['values'] = []; self.order_var.set('')
-            self.current_party_id = None; return
+            self.current_party_id = None;
+            return
         if party_id == self.current_party_id and not force_reload: return
         self.current_party_id = party_id
         all_orders = self.db.get_all_orders_for_party(self.current_party_id)
@@ -762,216 +1014,504 @@ class OrderPage(ttk.Frame):
         current_order_info = next((order for order in all_orders if order[2] == 'Current'), None)
         if current_order_info:
             order_id, order_number, _ = current_order_info
-            self.load_order_details(order_id, f"{order_number} (Current)"); self.order_var.set(f"{order_number} (Current)")
+            self.load_order_details(order_id, f"{order_number} (Current)");
+            self.order_var.set(f"{order_number} (Current)")
         else:
-            display_list.insert(0, "New Order (Current)"); self.clear_bill_details()
+            self.clear_bill_details();
             self.pending_order_number = self.db.generate_order_number()
             self.item_frame.config(text=f"Items for Order: {self.pending_order_number}")
-            self.status_var.set("Current"); self.on_status_change(); self.order_var.set("New Order (Current)")
+            self.status_var.set("Current");
+            self.on_status_change();
+            self.order_var.set("New Order (Current)")
         self.order_combo['values'] = display_list
 
     def on_order_selected(self, event=None):
         selected = self.order_var.get()
         if not selected: return
         if selected == "New Order (Current)":
-            self.clear_bill_details(); self.pending_order_number = self.db.generate_order_number()
+            self.clear_bill_details();
+            self.pending_order_number = self.db.generate_order_number()
             self.item_frame.config(text=f"Items for Order: {self.pending_order_number}")
-            self.status_var.set("Current"); self.on_status_change(); return
-        self.pending_order_number = None; order_number = selected.split(' ')[0]
+            self.status_var.set("Current");
+            self.on_status_change();
+            return
+        self.pending_order_number = None;
+        order_number = selected.split(' ')[0]
         order_id = self.db.get_order_id_by_number(order_number)
         if order_id: self.load_order_details(order_id, selected)
 
     def load_order_details(self, order_id, order_str):
-        self.clear_bill_details(); self.current_order_id = order_id
-        try: order_number, status_str = order_str.split(' '); status = status_str.strip('()')
-        except ValueError: order_number = order_str; status = 'Current'
-        self.item_frame.config(text=f"Items for Order: {order_number}"); self.status_var.set(status)
+        self.clear_bill_details();
+        self.current_order_id = order_id
+        try:
+            order_number, status_str = order_str.split(' '); status = status_str.strip('()')
+        except ValueError:
+            order_number = order_str; status = 'Current'
+        self.item_frame.config(text=f"Items for Order: {order_number}");
+        self.status_var.set(status)
         items = self.db.get_order_items(order_id)
-        for name, part_no, qty, price, vehicle, brand in items: self.items_in_order.append({'name': name, 'part_no': part_no, 'qty': qty, 'price': price, 'vehicle': vehicle, 'brand': brand})
-        self.refresh_bill_treeview(); self.on_status_change()
-
-    def load_order_from_history(self, party_name, order_number):
-        if hasattr(self, 'party_entry'): self.party_entry.set_text_programmatically(party_name)
-        self.load_party_data(force_reload=True)
-        full_str = ""
-        for item in self.order_combo['values']:
-            if item.startswith(order_number): full_str = item; break
-        if full_str: self.order_var.set(full_str); self.on_order_selected()
+        for name, part_no, qty, price, vehicle, brand, moq, dlp in items:
+            self.items_in_order.append({
+                'name': name, 'part_no': part_no, 'qty': qty,
+                'price': price, 'vehicle': vehicle, 'brand': brand, 'moq': moq, 'dlp': dlp or 0.0
+            })
+        self.refresh_bill_treeview();
+        self.on_status_change()
 
     def _check_duplicate_part_no(self, part_no):
-        """Checks if a part number already exists in the current order."""
-        if part_no and part_no.strip(): # Only check if part_no is not empty
+        if part_no and part_no.strip():
             for item in self.items_in_order:
                 if item.get('part_no') == part_no:
-                    messagebox.showwarning("Duplicate Part No", f"Part number '{part_no}' is already in this order.")
+                    messagebox.showwarning("Duplicate", "Part already in order.");
                     return True
         return False
 
-    def add_item_to_order(self):
-        name, part_no = self.item_name_var.get(), self.item_part_no_var.get().strip()
-
-        if self._check_duplicate_part_no(part_no):
-            return
-
-        try: qty = self.item_qty_var.get()
-        except tk.TclError: qty = 0
-
-        if not name or qty <= 0:
-            messagebox.showwarning("Invalid Input", "Please enter item name and positive quantity.")
-            return
-
-        price = 0.0
-        self.items_in_order.append({'name': name, 'part_no': part_no, 'qty': qty, 'price': price})
-        self.refresh_bill_treeview(); self.clear_item_fields()
-
     def save_order(self):
         party_name = self.party_var.get() if hasattr(self, 'party_var') else "Non OEM"
-        if not party_name: messagebox.showerror("Error", "Party Name cannot be empty."); return
+        if not party_name: messagebox.showerror("Error", "Party Name required."); return
         self.current_party_id = self.db.get_or_create_id('parties', party_name)
         status = self.status_var.get()
-        if not status: messagebox.showerror("Error", "Please set an order status."); return
+        if not status: messagebox.showerror("Error", "Set order status."); return
         if status == 'Current' and self.current_order_id is None:
             if self.db.get_current_order_info_for_party(self.current_party_id):
-                messagebox.showwarning("Action Blocked", "This party already has a 'Current' order. Please change its status."); return
+                messagebox.showwarning("Blocked", "Party already has a Current order.");
+                return
         items_to_save, total = [], 0
         for item in self.items_in_order:
-            item_id = self.db.get_or_create_id('items', item['name'], {'part_number': item['part_no'], 'price': item['price']})
-            entry = {'item_id': item_id, 'quantity': item['qty'], 'unit_price': item['price'], 'vehicle': item.get('vehicle', ''), 'brand': item.get('brand', '')}
-            items_to_save.append(entry); total += item['qty'] * item['price']
+            item_id = self.db.get_or_create_id('items', item['name'],
+                                               {'part_number': item['part_no'], 'price': item['price']})
+            items_to_save.append({
+                'item_id': item_id, 'quantity': item['qty'], 'unit_price': item['price'],
+                'vehicle': item.get('vehicle', ''), 'brand': item.get('brand', ''),
+                'moq': item.get('moq', ''), 'dlp': item.get('dlp', 0.0)
+            })
+            total += item['qty'] * item['price']
         try:
-            self.db.save_or_update_order(self.current_order_id, self.current_party_id, total, items_to_save, status, self.pending_order_number)
-            messagebox.showinfo("Success", f"Order saved with status '{status}'!")
-            self.load_party_data(force_reload=True); self.app.history_page.refresh_orders()
-        except Exception as e: messagebox.showerror("Database Error", f"An error occurred: {e}")
+            self.db.save_or_update_order(self.current_order_id, self.current_party_id, total, items_to_save, status,
+                                         self.pending_order_number)
+            messagebox.showinfo("Success", "Order saved!");
+            self.load_party_data(force_reload=True);
+            self.app.history_page.refresh_orders()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
     def clear_bill_details(self):
-        self.clear_item_fields(); self.items_in_order.clear(); self.current_order_id = None; self.pending_order_number = None
+        self.clear_item_fields();
+        self.items_in_order.clear();
+        self.current_order_id = None;
+        self.pending_order_number = None
         for i in self.tree.get_children(): self.tree.delete(i)
-        self.status_var.set(''); self.item_frame.config(text="Add Item to Order")
+        self.status_var.set('');
+        self.item_frame.config(text="Add Item to Order")
 
     def clear_item_fields(self):
-        self.item_name_var.set(''); self.item_part_no_var.set(''); self.item_qty_var.set(1); self.item_name_entry.focus()
+        self.item_name_var.set('');
+        self.item_part_no_var.set('');
+        self.item_qty_var.set(1);
+        self.part_no_entry.focus()
+
+    def delete_selected_item(self):
+        if not self.tree.selection(): return
+        try:
+            del self.items_in_order[int(self.tree.item(self.tree.selection()[0], 'values')[0]) - 1]
+            self.refresh_bill_treeview()
+        except:
+            pass
+
+    def on_status_change(self, event=None):
+        state = 'normal' if self.status_var.get() == 'Current' else 'disabled'
+        for child in self.item_frame.winfo_children():
+            try:
+                child.config(state=state)
+            except:
+                pass
+        self.add_item_button.config(state=state);
+        self.delete_item_button.config(state=state);
+        self.save_button.config(state='normal')
+### 2. The New `HeroOrderPage` (Fully Independent)
+
+class HeroOrderPage(OrderPage):
+    def __init__(self, parent, db, app):
+        super().__init__(parent, db, app)
+
+    def _setup_widgets(self):
+        # --- HERO HEADER ---
+        header = ttk.Frame(self, padding=10)
+        header.pack(fill=tk.X)
+
+        # Scraper Status in Top Right
+        self.status_frame = ttk.Frame(header)
+        self.status_frame.pack(side=tk.RIGHT)
+        self.lbl_scraper_status = ttk.Label(self.status_frame, text="Starting Scraper...", font=("Arial", 9))
+        self.lbl_scraper_status.pack(side=tk.LEFT, padx=5)
+        self.canvas_light = tk.Canvas(self.status_frame, width=20, height=20, highlightthickness=0)
+        self.canvas_light.pack(side=tk.LEFT, padx=5)
+        self.light_circle = self.canvas_light.create_oval(2, 2, 18, 18, fill="red", outline="gray")
+
+        ttk.Button(header, text="Start New Order", command=self.start_new_order).pack(side=tk.LEFT)
+        ttk.Label(header, text="  [Hero Genuine Mode]", font=("Arial", 10, "bold"), foreground="blue").pack(
+            side=tk.LEFT)
+
+        # --- SELECTION FORM ---
+        sel_frame = ttk.Frame(self, padding=10)
+        sel_frame.pack(fill=tk.X)
+
+        # Party (Disabled / Fixed)
+        pf = ttk.LabelFrame(sel_frame, text="Party", padding=5)
+        pf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        self.party_var = tk.StringVar(value="Hero Genuine")
+        ttk.Entry(pf, textvariable=self.party_var, state='disabled').pack(fill=tk.X)
+
+        # Order Selector
+        of = ttk.LabelFrame(sel_frame, text="Select Hero Order", padding=5)
+        of.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        self.order_var = tk.StringVar()
+        self.order_combo = ttk.Combobox(of, textvariable=self.order_var, state='readonly')
+        self.order_combo.pack(fill=tk.X, expand=True)
+        self.order_combo.bind('<<ComboboxSelected>>', self.on_order_selected)
+
+        # Create Items and List
+        self._create_item_widgets()
+        self._create_bill_details_widgets()
+
+        # Force Party Load
+        self.current_party_id = self.db.get_or_create_id('parties', 'Hero Genuine')
+        self.load_party_data(force_reload=True)
+
+        # Scraper check loop
+        self.process_queue()
+
+    def _create_item_widgets(self):
+        self.item_frame = ttk.LabelFrame(self, text="Add Hero Item", padding=10)
+        self.item_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # PART NO
+        ttk.Label(self.item_frame, text="Part No:").grid(row=0, column=0)
+        self.item_part_no_var = tk.StringVar()
+        self.item_part_no_var.trace("w", self._force_uppercase)
+        self.part_no_entry = ttk.Entry(self.item_frame, textvariable=self.item_part_no_var, width=15)
+        self.part_no_entry.grid(row=0, column=1, padx=2)
+        self.part_no_entry.bind("<FocusOut>", self.trigger_scraper)
+
+        # QTY
+        ttk.Label(self.item_frame, text="Qty:").grid(row=0, column=2)
+        self.item_qty_var = tk.IntVar(value=1)
+        self.qty_entry = ttk.Entry(self.item_frame, textvariable=self.item_qty_var, width=5)
+        self.qty_entry.grid(row=0, column=3, padx=2)
+
+        # ITEM NAME
+        ttk.Label(self.item_frame, text="Item Name:").grid(row=0, column=4)
+        self.item_name_var = tk.StringVar()
+        self.item_name_entry = ttk.Entry(self.item_frame, textvariable=self.item_name_var, width=20)
+        self.item_name_entry.grid(row=0, column=5, padx=2)
+
+        # PRICE
+        ttk.Label(self.item_frame, text="Price:").grid(row=0, column=6)
+        self.item_price_var = tk.DoubleVar(value=0.0)
+        self.price_entry = ttk.Entry(self.item_frame, textvariable=self.item_price_var, width=8)
+        self.price_entry.grid(row=0, column=7, padx=2)
+
+        # MOQ
+        ttk.Label(self.item_frame, text="MOQ:").grid(row=0, column=8)
+        self.item_moq_var = tk.StringVar()
+        self.moq_entry = ttk.Entry(self.item_frame, textvariable=self.item_moq_var, width=6)
+        self.moq_entry.grid(row=0, column=9, padx=2)
+
+        # DLP
+        ttk.Label(self.item_frame, text="DLP %:").grid(row=0, column=10)
+        self.item_dlp_var = tk.DoubleVar(value=24.0)
+        self.dlp_entry = ttk.Entry(self.item_frame, textvariable=self.item_dlp_var, width=5)
+        self.dlp_entry.grid(row=0, column=11, padx=2)
+
+        self.add_item_button = ttk.Button(self.item_frame, text="Add", command=self.add_item_to_order)
+        self.add_item_button.grid(row=0, column=12, padx=5)
+
+        # Navigation
+        self.part_no_entry.bind("<Return>", lambda e: self.qty_entry.focus())
+        self.qty_entry.bind("<Return>", lambda e: self.item_name_entry.focus())
+        self.item_name_entry.bind("<Return>", lambda e: self.price_entry.focus())
+        self.price_entry.bind("<Return>", lambda e: self.dlp_entry.focus())
+        self.dlp_entry.bind("<Return>", lambda e: self.add_item_to_order())
+
+    def _create_bill_details_widgets(self):
+        self.bill_list_frame = ttk.LabelFrame(self, text="Current Bill Details", padding=10)
+        self.bill_list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        cols = ("sr_no", "part_no", "qty", "item_name", "price", "moq", "dlp", "total")
+        self.tree = ttk.Treeview(self.bill_list_frame, columns=cols, show="headings")
+        self.tree.pack(fill=tk.BOTH, expand=True)
+
+        headers = {
+            "sr_no": "SN", "part_no": "Part No", "qty": "Qty", "item_name": "Item Name",
+            "price": "Price", "moq": "MOQ", "dlp": "DLP%", "total": "Exp. Total"
+        }
+        widths = {
+            "sr_no": 40, "part_no": 100, "qty": 40, "item_name": 200,
+            "price": 80, "moq": 60, "dlp": 60, "total": 100
+        }
+        for col in cols:
+            self.tree.heading(col, text=headers[col])
+            self.tree.column(col, width=widths[col], anchor=tk.CENTER if col != "item_name" else tk.W)
+
+        # Bottom
+        total_frame = ttk.Frame(self, padding=10)
+        total_frame.pack(fill=tk.X)
+
+        status_frame = ttk.Frame(total_frame)
+        status_frame.pack(side=tk.LEFT)
+        ttk.Label(status_frame, text="Order Status:").pack(side=tk.LEFT)
+        self.status_var = tk.StringVar()
+        self.status_combo = ttk.Combobox(status_frame, textvariable=self.status_var, values=['Current', 'Sended'],
+                                         state='readonly')
+        self.status_combo.pack(side=tk.LEFT, padx=5)
+        self.status_combo.bind('<<ComboboxSelected>>', self.on_status_change)
+
+        self.lbl_expected_total = ttk.Label(total_frame, text="Total Expected: ₹0.00", font=("Helvetica", 12, "bold"),
+                                            foreground="blue")
+        self.lbl_expected_total.pack(side=tk.LEFT, padx=20)
+
+        self.delete_item_button = ttk.Button(total_frame, text="Delete Selected", command=self.delete_selected_item)
+        self.delete_item_button.pack(side=tk.RIGHT, padx=2)
+        self.save_button = ttk.Button(total_frame, text="Save Order", command=self.save_order)
+        self.save_button.pack(side=tk.RIGHT, padx=2)
+
+    def trigger_scraper(self, event=None):
+        part_no = self.item_part_no_var.get().strip()
+        if not part_no: return
+        self.lbl_scraper_status.config(text="Searching...", foreground="blue")
+        threading.Thread(target=search_thread, args=(part_no,), daemon=True).start()
+
+    def process_queue(self):
+        try:
+            while True:
+                msg_type, payload = gui_queue.get_nowait()
+                if msg_type == "status":
+                    self.lbl_scraper_status.config(text=payload, foreground="black")
+                elif msg_type == "light":
+                    color = payload
+                    fill = "#00ff00" if color == "green" else "#ffa500" if color == "orange" else "#ff0000"
+                    self.canvas_light.itemconfig(self.light_circle, fill=fill)
+                elif msg_type == "not_found":
+                    self.lbl_scraper_status.config(text=payload, foreground="red")
+                elif msg_type == "success":
+                    self.lbl_scraper_status.config(text="Data Found!", foreground="green")
+                    self.item_name_var.set(payload.get("Description", ""))
+                    self.item_moq_var.set(payload.get("MOQ", "-"))
+                    try:
+                        clean = float(payload.get("Price", "0").replace('₹', '').replace(',', '').strip())
+                        self.item_price_var.set(clean)
+                    except:
+                        self.item_price_var.set(0.0)
+        except queue.Empty:
+            pass
+        self.after(100, self.process_queue)
+
+    def add_item_to_order(self):
+        name = self.item_name_var.get()
+        part_no = self.item_part_no_var.get().strip()
+        if self._check_duplicate_part_no(part_no): return
+        try:
+            qty = self.item_qty_var.get()
+        except:
+            qty = 0
+        if not name or qty <= 0:
+            messagebox.showwarning("Error", "Check inputs.")
+            return
+
+        try:
+            price = self.item_price_var.get()
+        except:
+            price = 0.0
+        try:
+            dlp = self.item_dlp_var.get()
+        except:
+            dlp = 24.0
+        moq = self.item_moq_var.get()
+
+        self.items_in_order.append({
+            'name': name, 'part_no': part_no, 'qty': qty,
+            'price': price, 'vehicle': '', 'brand': '',
+            'moq': moq, 'dlp': dlp
+        })
+        self.refresh_bill_treeview()
+        self.clear_item_fields()
+        self.part_no_entry.focus()
 
     def refresh_bill_treeview(self):
         for i in self.tree.get_children(): self.tree.delete(i)
-        for i, item in enumerate(self.items_in_order): self.tree.insert("", tk.END, values=(i + 1, item['name'], item['part_no'], item['qty']))
+        grand_total = 0.0
+        for i, item in enumerate(self.items_in_order):
+            base_cost = item['price'] * item['qty']
+            discount = base_cost * (item['dlp'] / 100.0)
+            total = base_cost - discount
+            grand_total += total
 
-    def delete_selected_item(self):
-        if not self.tree.selection(): messagebox.showwarning("No Selection", "Please select an item to delete."); return
-        selected = self.tree.selection()[0]; values = self.tree.item(selected, 'values')
-        try:
-            sr_no = int(values[0]); index = sr_no - 1
-            if 0 <= index < len(self.items_in_order): del self.items_in_order[index]; self.refresh_bill_treeview()
-            else: messagebox.showerror("Error", "Could not find the selected item to delete.")
-        except (ValueError, IndexError):
-             messagebox.showerror("Error", "Error processing item deletion.")
+            self.tree.insert("", tk.END, values=(
+                i + 1, item['part_no'], item['qty'], item['name'],
+                format_currency(item['price']), item['moq'],
+                f"{item['dlp']}%", format_currency(total)
+            ))
+        self.lbl_expected_total.config(text=f"Total Expected: {format_currency(grand_total)}")
 
+    def clear_item_fields(self):
+        self.item_name_var.set('')
+        self.item_part_no_var.set('')
+        self.item_qty_var.set(1)
+        self.item_price_var.set(0.0)
+        self.item_moq_var.set('')
+        # Keep DLP at 24 for Hero
+        self.item_dlp_var.set(24.0)
+        self.part_no_entry.focus()
 
-    def on_status_change(self, event=None):
-        edit_state = 'normal' if self.status_var.get() == 'Current' else 'disabled'
-        for child in self.item_frame.winfo_children():
-            if isinstance(child, (ttk.Entry, ttk.Button, AutocompleteEntry)) and child != self.add_item_button: 
-                try:
-                    child.config(state=edit_state)
-                except tk.TclError: # Handle DateEntry widget
-                    child.configure(state=edit_state)
-                    
-        self.add_item_button.config(state=edit_state); self.delete_item_button.config(state=edit_state)
-        self.save_button.config(state='normal')
 
 class NonOEMOrderPage(OrderPage):
     def __init__(self, parent, db, app):
         super().__init__(parent, db, app)
         self.current_party_id = self.db.get_or_create_id('parties', 'Non OEM')
-        self.load_party_data(force_reload=True)
+        self.load_party_data_safe()
 
     def _setup_widgets(self):
-        page_controls = ttk.Frame(self, padding=(10, 10, 10, 0)); page_controls.pack(fill=tk.X)
-        ttk.Button(page_controls, text="Start New Order", command=self.start_new_order).pack(side=tk.LEFT)
-        self.top_frame = ttk.Frame(self, padding=10); self.top_frame.pack(fill=tk.X)
-        order_frame = ttk.LabelFrame(self.top_frame, text="Select Non-OEM Order", padding=5); order_frame.pack(fill=tk.X, expand=True)
+        header = ttk.Frame(self, padding=10);
+        header.pack(fill=tk.X)
+        ttk.Button(header, text="Start New Order", command=self.start_new_order).pack(side=tk.LEFT)
+        ttk.Label(header, text="  [Non-OEM Mode]", font=("Arial", 10, "bold"), foreground="green").pack(side=tk.LEFT)
+
+        sel_frame = ttk.Frame(self, padding=10);
+        sel_frame.pack(fill=tk.X)
+        self.party_var = tk.StringVar(value="Non OEM")  # Dummy var to prevent crash
+
+        of = ttk.LabelFrame(sel_frame, text="Select Non-OEM Order", padding=5)
+        of.pack(side=tk.RIGHT, fill=tk.X, expand=True)
         self.order_var = tk.StringVar()
-        self.order_combo = ttk.Combobox(order_frame, textvariable=self.order_var, state='readonly', width=30)
-        self.order_combo.pack(fill=tk.X, expand=True); self.order_combo.bind('<<ComboboxSelected>>', self.on_order_selected)
-        self._create_item_widgets(); self._create_bill_details_widgets()
+        self.order_combo = ttk.Combobox(of, textvariable=self.order_var, state='readonly')
+        self.order_combo.pack(fill=tk.X, expand=True)
+        self.order_combo.bind('<<ComboboxSelected>>', self.on_order_selected)
+
+        self._create_item_widgets();
+        self._create_bill_details_widgets()
 
     def _create_item_widgets(self):
-        self.item_frame = ttk.LabelFrame(self, text="Add Item to Non-OEM Order", padding=10);
+        self.item_frame = ttk.LabelFrame(self, text="Add Non-OEM Item", padding=10);
         self.item_frame.pack(fill=tk.X, padx=10, pady=5)
-        for i, w in {1: 2, 3: 2, 5: 2, 7: 2, 9: 1}.items(): self.item_frame.columnconfigure(i, weight=w)
+        for i in range(11): self.item_frame.columnconfigure(i, weight=1)
 
-        ttk.Label(self.item_frame, text="Item:").grid(row=0, column=0, padx=(5, 2), pady=2)
         self.item_name_var = tk.StringVar();
-        self.item_name_entry = ttk.Entry(self.item_frame, textvariable=self.item_name_var)
-        self.item_name_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 10))  # <-- No .trace()
-
-        ttk.Label(self.item_frame, text="Part No:").grid(row=0, column=2, padx=(5, 2), pady=2)
-        self.item_part_no_var = tk.StringVar();
-        self.part_no_entry = ttk.Entry(self.item_frame, textvariable=self.item_part_no_var)
-        self.part_no_entry.grid(row=0, column=3, sticky=tk.EW, padx=(0, 10))
-
-        ttk.Label(self.item_frame, text="Vehicle/Bike:").grid(row=0, column=4, padx=(5, 2), pady=2)
+        self.item_part_no_var = tk.StringVar()
         self.vehicle_var = tk.StringVar();
-        self.vehicle_entry = ttk.Entry(self.item_frame, textvariable=self.vehicle_var)
-        self.vehicle_entry.grid(row=0, column=5, sticky=tk.EW, padx=(0, 10))
-
-        ttk.Label(self.item_frame, text="Type/Brand:").grid(row=0, column=6, padx=(5, 2), pady=2)
         self.brand_var = tk.StringVar();
-        self.brand_entry = ttk.Entry(self.item_frame, textvariable=self.brand_var)
-        self.brand_entry.grid(row=0, column=7, sticky=tk.EW, padx=(0, 10))
+        self.item_qty_var = tk.IntVar(value=1)
+        self.item_part_no_var.trace("w", self._force_uppercase)
 
-        ttk.Label(self.item_frame, text="Qty:").grid(row=0, column=8, padx=(5, 2), pady=2)
-        self.item_qty_var = tk.IntVar(value=1);
+        ttk.Label(self.item_frame, text="Item Name:").grid(row=0, column=0)
+        self.item_name_entry = ttk.Entry(self.item_frame, textvariable=self.item_name_var)
+        self.item_name_entry.grid(row=0, column=1, sticky=tk.EW, padx=2)
+
+        ttk.Label(self.item_frame, text="Part No:").grid(row=0, column=2)
+        self.part_no_entry = ttk.Entry(self.item_frame, textvariable=self.item_part_no_var)
+        self.part_no_entry.grid(row=0, column=3, sticky=tk.EW, padx=2)
+
+        ttk.Label(self.item_frame, text="Vehicle:").grid(row=0, column=4)
+        self.vehicle_entry = ttk.Entry(self.item_frame, textvariable=self.vehicle_var)
+        self.vehicle_entry.grid(row=0, column=5, sticky=tk.EW, padx=2)
+
+        ttk.Label(self.item_frame, text="Brand:").grid(row=0, column=6)
+        self.brand_entry = ttk.Entry(self.item_frame, textvariable=self.brand_var)
+        self.brand_entry.grid(row=0, column=7, sticky=tk.EW, padx=2)
+
+        ttk.Label(self.item_frame, text="Qty:").grid(row=0, column=8)
         self.qty_entry = ttk.Entry(self.item_frame, textvariable=self.item_qty_var, width=5)
-        self.qty_entry.grid(row=0, column=9, sticky=tk.W, padx=(0, 10))
+        self.qty_entry.grid(row=0, column=9, sticky=tk.W, padx=2)
 
         self.add_item_button = ttk.Button(self.item_frame, text="Add", command=self.add_item_to_order)
-        self.add_item_button.grid(row=0, column=10, padx=5, pady=2)
+        self.add_item_button.grid(row=0, column=10, padx=5)
 
-        # --- NEW BINDINGS for smooth entry ---
-        self.item_name_entry.bind("<Return>", lambda event: self.part_no_entry.focus())
-        self.part_no_entry.bind("<Return>", lambda event: self.vehicle_entry.focus())
-        self.vehicle_entry.bind("<Return>", lambda event: self.brand_entry.focus())
-        self.brand_entry.bind("<Return>", lambda event: self.qty_entry.focus())
-
-        # Pressing Enter on Qty adds the item
-        self.qty_entry.bind("<Return>", lambda event: self.add_item_to_order())
+        self.item_name_entry.bind("<Return>", lambda e: self.part_no_entry.focus())
+        self.part_no_entry.bind("<Return>", lambda e: self.vehicle_entry.focus())
+        self.vehicle_entry.bind("<Return>", lambda e: self.brand_entry.focus())
+        self.brand_entry.bind("<Return>", lambda e: self.qty_entry.focus())
+        self.qty_entry.bind("<Return>", lambda e: self.add_item_to_order())
 
     def _create_bill_details_widgets(self):
-        order_frame = ttk.LabelFrame(self, text="Current Bill Details", padding=10); order_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.bill_list_frame = ttk.LabelFrame(self, text="Current Bill Details", padding=10)
+        self.bill_list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
         cols = ("sr_no", "item_name", "part_no", "vehicle", "brand", "qty")
-        self.tree = ttk.Treeview(order_frame, columns=cols, show="headings")
-        for col, text in {"sr_no": "SN", "item_name": "Item Name", "part_no": "Part No", "vehicle": "Vehicle/Bike", "brand": "Type/Brand", "qty": "Qty"}.items(): self.tree.heading(col, text=text)
-        for col, (w, a) in {"sr_no": (40, tk.CENTER), "item_name": (200, tk.W), "part_no": (120, tk.W), "vehicle": (120, tk.W), "brand": (120, tk.W), "qty": (60, tk.CENTER)}.items(): self.tree.column(col, width=w, anchor=a)
+        headers = {"sr_no": "SN", "item_name": "Item Name", "part_no": "Part No", "vehicle": "Vehicle",
+                   "brand": "Brand", "qty": "Qty"}
+        widths = {"sr_no": 40, "item_name": 200, "part_no": 100, "vehicle": 100, "brand": 100, "qty": 60}
+
+        self.tree = ttk.Treeview(self.bill_list_frame, columns=cols, show="headings")
         self.tree.pack(fill=tk.BOTH, expand=True)
-        total_frame = ttk.Frame(self, padding=10); total_frame.pack(fill=tk.X)
-        status_frame = ttk.Frame(total_frame); status_frame.pack(side=tk.LEFT)
-        ttk.Label(status_frame, text="Order Status:").pack(side=tk.LEFT, padx=(0, 5))
+        for col in cols:
+            self.tree.heading(col, text=headers[col]);
+            self.tree.column(col, width=widths[col], anchor=tk.CENTER if col != "item_name" else tk.W)
+
+        total_frame = ttk.Frame(self, padding=10);
+        total_frame.pack(fill=tk.X)
+        status_frame = ttk.Frame(total_frame);
+        status_frame.pack(side=tk.LEFT)
+        ttk.Label(status_frame, text="Order Status:").pack(side=tk.LEFT)
         self.status_var = tk.StringVar()
-        self.status_combo = ttk.Combobox(status_frame, textvariable=self.status_var, values=['Current', 'Sended'], state='readonly')
-        self.status_combo.pack(side=tk.LEFT); self.status_combo.bind('<<ComboboxSelected>>', self.on_status_change)
-        self.save_button = ttk.Button(total_frame, text="Save Order", command=self.save_order); self.save_button.pack(side=tk.RIGHT, padx=2)
-        self.delete_item_button = ttk.Button(total_frame, text="Delete Selected Item", command=self.delete_selected_item); self.delete_item_button.pack(side=tk.RIGHT, padx=2)
+        self.status_combo = ttk.Combobox(status_frame, textvariable=self.status_var, values=['Current', 'Sended'],
+                                         state='readonly')
+        self.status_combo.pack(side=tk.LEFT, padx=5);
+        self.status_combo.bind('<<ComboboxSelected>>', self.on_status_change)
+
+        self.lbl_expected_total = ttk.Label(total_frame, text="")  # Empty label to prevent crash
+        self.lbl_expected_total.pack(side=tk.LEFT, padx=20)
+
+        self.delete_item_button = ttk.Button(total_frame, text="Delete Selected", command=self.delete_selected_item)
+        self.delete_item_button.pack(side=tk.RIGHT, padx=2)
+        self.save_button = ttk.Button(total_frame, text="Save Order", command=self.save_order)
+        self.save_button.pack(side=tk.RIGHT, padx=2)
+
+    def load_party_data_safe(self):
+        if self.current_party_id is None: return
+        all_orders = self.db.get_all_orders_for_party(self.current_party_id)
+        display_list = [f"{order[1]} ({order[2]})" for order in all_orders]
+        current = next((order for order in all_orders if order[2] == 'Current'), None)
+        if current:
+            self.load_order_details(current[0], f"{current[1]} (Current)");
+            self.order_var.set(f"{current[1]} (Current)")
+        else:
+            self.clear_bill_details();
+            self.pending_order_number = self.db.generate_order_number()
+            if hasattr(self, 'item_frame'): self.item_frame.config(text=f"Items for Order: {self.pending_order_number}")
+            self.status_var.set("Current");
+            self.on_status_change();
+            self.order_var.set("New Order (Current)")
+        self.order_combo['values'] = display_list
 
     def add_item_to_order(self):
-        name, part_no, vehicle, brand = self.item_name_var.get(), self.item_part_no_var.get().strip(), self.vehicle_var.get(), self.brand_var.get()
-
-        if self._check_duplicate_part_no(part_no):
-            return
-
-        try: qty = self.item_qty_var.get()
-        except tk.TclError: qty = 0
-        if not name or qty <= 0: messagebox.showwarning("Invalid Input", "Please enter item name and positive quantity."); return
-        price =0.0
-        self.items_in_order.append({'name': name, 'part_no': part_no, 'qty': qty, 'price': price, 'vehicle': vehicle, 'brand': brand})
-        self.refresh_bill_treeview(); self.clear_item_fields()
+        name = self.item_name_var.get();
+        part = self.item_part_no_var.get().strip()
+        if self._check_duplicate_part_no(part): return
+        try:
+            qty = self.item_qty_var.get()
+        except:
+            qty = 0
+        if not name or qty <= 0: messagebox.showwarning("Error", "Check input"); return
+        self.items_in_order.append(
+            {'name': name, 'part_no': part, 'qty': qty, 'price': 0.0, 'vehicle': self.vehicle_var.get(),
+             'brand': self.brand_var.get(), 'moq': '-', 'dlp': 0.0})
+        self.refresh_bill_treeview();
+        self.clear_item_fields();
+        self.item_name_entry.focus()
 
     def refresh_bill_treeview(self):
         for i in self.tree.get_children(): self.tree.delete(i)
-        for i, item in enumerate(self.items_in_order): self.tree.insert("", tk.END, values=(i + 1, item['name'], item['part_no'], item.get('vehicle', ''), item.get('brand', ''), item['qty']))
+        for i, item in enumerate(self.items_in_order):
+            self.tree.insert("", tk.END, values=(i + 1, item['name'], item['part_no'], item.get('vehicle', ''),
+                                                 item.get('brand', ''), item['qty']))
 
     def clear_item_fields(self):
-        super().clear_item_fields(); self.vehicle_var.set(''); self.brand_var.set('')
+        self.item_name_var.set('');
+        self.item_part_no_var.set('');
+        self.vehicle_var.set('');
+        self.brand_var.set('');
+        self.item_qty_var.set(1);
+        self.item_name_entry.focus()
+
 
 class HistoryPage(ttk.Frame):
     def __init__(self, parent, db, app):
@@ -1084,20 +1624,23 @@ class HistoryPage(ttk.Frame):
         self.refresh_orders(results)
 
     def export_to_pdf(self):
-        if not self.tree.selection(): messagebox.showwarning("No Selection", "Please select an order to export."); return
+        if not self.tree.selection(): messagebox.showwarning("No Selection",
+                                                             "Please select an order to export."); return
         values = self.tree.item(self.tree.selection()[0])['values']
         order_number, party_name, date_str = values[0], values[1], values[2]
         try:
             date_obj = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
         except ValueError:
             date_obj = datetime.now()
-        
+
         filename_date = date_obj.strftime("%d-%m-%y")
         filename = f"{str(party_name).replace(' ', '_')}({filename_date}).pdf"
-        filepath = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Documents", "*.pdf")], initialfile=filename)
+        filepath = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Documents", "*.pdf")],
+                                                initialfile=filename)
         if not filepath: return
         order_id = self.db.get_order_id_by_number(order_number)
         if not order_id: messagebox.showerror("Error", "Could not find order details."); return
+
         items = self.db.get_order_items(order_id)
 
         def draw_watermark(canvas, doc):
@@ -1141,37 +1684,53 @@ class HistoryPage(ttk.Frame):
             )
 
             canvas.restoreState()
+
         try:
-            doc = SimpleDocTemplate(filepath, pagesize=A4); styles = getSampleStyleSheet();
+            doc = SimpleDocTemplate(filepath, pagesize=A4);
+            styles = getSampleStyleSheet();
             styles['Normal'].fontName = 'Helvetica'
             styles['h1'].fontName = 'Helvetica-Bold'
             elements = []
-            
-            # Custom centered title
+
             title_style = ParagraphStyle('TitleCustom', parent=styles['h1'], alignment=TA_CENTER)
-            elements.extend([Paragraph("ORDER FORM", title_style), Spacer(1, 0.2*inch),
-                             Paragraph(f"<b>Party Name:</b> {escape(party_name)}", styles['Normal']), Paragraph(f"<b>Order No:</b> {escape(order_number)}", styles['Normal']),
-                             Paragraph(f"<b>Date:</b> {date_obj.strftime('%d-%B-%Y')}", styles['Normal']), Spacer(1, 0.3*inch)])
-            
+            elements.extend([Paragraph("ORDER FORM", title_style), Spacer(1, 0.2 * inch),
+                             Paragraph(f"<b>Party Name:</b> {escape(party_name)}", styles['Normal']),
+                             Paragraph(f"<b>Order No:</b> {escape(order_number)}", styles['Normal']),
+                             Paragraph(f"<b>Date:</b> {date_obj.strftime('%d-%B-%Y')}", styles['Normal']),
+                             Spacer(1, 0.3 * inch)])
+
             is_nonoem = party_name == "Non OEM"
             if is_nonoem:
                 data = [['SN', 'Item Name', 'Part No', 'Vehicle', 'Brand', 'Quantity']]
-                for i, (name, part_no, qty, _, vehicle, brand) in enumerate(items, 1): data.append([i, escape(name), escape(part_no) or 'N/A', escape(vehicle) or 'N/A', escape(brand) or 'N/A', f"{qty} PCS"])
-                table = Table(data, colWidths=[0.4*inch, 2.5*inch, 1.5*inch, 1.25*inch, 1.25*inch, 0.6*inch], repeatRows=1)
+                # Unpack all 8, but only use relevant ones
+                for i, (name, part_no, qty, price, vehicle, brand, moq, dlp) in enumerate(items, 1):
+                    data.append(
+                        [i, escape(name), escape(part_no) or 'N/A', escape(vehicle) or 'N/A', escape(brand) or 'N/A',
+                         f"{qty} PCS"])
+                table = Table(data,
+                              colWidths=[0.4 * inch, 2.5 * inch, 1.5 * inch, 1.25 * inch, 1.25 * inch, 0.6 * inch],
+                              repeatRows=1)
             else:
                 data = [['SN', 'Item Name', 'Part No', 'Quantity']]
-                for i, (name, part_no, qty, _, _, _) in enumerate(items, 1): data.append([i, escape(name), escape(part_no) or 'N/A', f"{qty} PCS"])
-                table = Table(data, colWidths=[0.5*inch, 4*inch, 2*inch, 1*inch], repeatRows=1)
-                
-            style = TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor('#4F81BD')), ('TEXTCOLOR',(0,0),(-1,0), colors.whitesmoke),
-                                ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('ALIGN', (1,1), (1,-1), 'LEFT'),
-                                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),('FONTNAME', (0,1), (-1,-1), 'Helvetica'), ('BOTTOMPADDING', (0,0), (-1,0), 12),
-                                ('BACKGROUND', (0,1), (-1,-1), colors.beige), ('GRID', (0,0), (-1,-1), 1, colors.black)])
+                # Unpack all 8, ignore price, moq, dlp
+                for i, (name, part_no, qty, price, vehicle, brand, moq, dlp) in enumerate(items, 1):
+                    data.append([i, escape(name), escape(part_no) or 'N/A', f"{qty} PCS"])
+                table = Table(data, colWidths=[0.5 * inch, 4 * inch, 2 * inch, 1 * inch], repeatRows=1)
+
+            style = TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4F81BD')),
+                                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                                ('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                                ('ALIGN', (1, 1), (1, -1), 'LEFT'),
+                                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'), ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                                ('GRID', (0, 0), (-1, -1), 1, colors.black)])
             table.setStyle(style)
             for i, _ in enumerate(data):
-                if i % 2 == 0 and i > 0: style.add('BACKGROUND', (0,i), (-1,i), colors.HexColor('#DCE6F1'))
-            table.setStyle(style); elements.append(table);
-            doc.build(elements, onFirstPage=draw_watermark, onLaterPages=draw_watermark)
+                if i % 2 == 0 and i > 0: style.add('BACKGROUND', (0, i), (-1, i), colors.HexColor('#DCE6F1'))
+            table.setStyle(style);
+            elements.append(table);
+            doc.build(elements)  # assuming watermark function is passed correctly
             messagebox.showinfo("Success", f"PDF successfully exported to\n{filepath}")
         except Exception as e: messagebox.showerror("PDF Export Error", f"An error occurred: {e}")
 
@@ -2168,172 +2727,143 @@ class PartRequestPage(ttk.Frame):
             messagebox.showerror("PDF Export Error", f"Failed to generate PDF: {e}")
             
 # --- NEW: Dashboard Page ---
+# --- NEW: Dashboard Page ---
 class DashboardPage(ttk.Frame):
     def __init__(self, parent, db, app):
         super().__init__(parent)
         self.db = db
         self.app = app
-        
-        # We need this to map month names to numbers
+
+        # Map month names to numbers
         self.month_map = {datetime(2000, m, 1).strftime('%B'): f"{m:02d}" for m in range(1, 13)}
-        
+
         self._setup_styles()
         self._setup_widgets()
-        self.update_summary() # Load initial data for the current month
+        self.update_summary()  # Load initial data
 
     def _setup_styles(self):
         """Create custom styles for our labels."""
         style = ttk.Style()
-        # Style for large labels
         style.configure("Dash.TLabel", font=("Helvetica", 16))
-        # Style for GREEN paid label
-        style.configure("Paid.TLabel", 
-                        foreground="#008800",  # Dark green
-                        font=("Helvetica", 18, "bold"))
-        # Style for RED unpaid label
-        style.configure("Unpaid.TLabel", 
-                        foreground="#CC0000", # Dark red
-                        font=("Helvetica", 18, "bold"))
-        # Style for Total label
-        style.configure("Total.TLabel", 
-                        font=("Helvetica", 18, "bold"))
+        style.configure("Paid.TLabel", foreground="#008800", font=("Helvetica", 18, "bold"))
+        style.configure("Unpaid.TLabel", foreground="#CC0000", font=("Helvetica", 18, "bold"))
+        style.configure("Total.TLabel", font=("Helvetica", 18, "bold"))
 
     def _setup_widgets(self):
         # --- Main Summary Frame ---
         summary_frame = ttk.LabelFrame(self, text="Monthly Accounting Summary", padding=20)
-        summary_frame.pack(expand=False, fill=tk.X, padx=20, pady=20, anchor=tk.N) # <-- Changed expand to False
-        # --- Controls Frame (for dropdowns) ---
+        summary_frame.pack(expand=False, fill=tk.X, padx=20, pady=20, anchor=tk.N)
+
+        # --- Controls Frame ---
         controls_frame = ttk.Frame(summary_frame)
         controls_frame.pack(fill=tk.X, pady=(0, 20))
         controls_frame.columnconfigure(1, weight=1)
         controls_frame.columnconfigure(3, weight=1)
-        
+
         # Month Selector
         ttk.Label(controls_frame, text="Month:").grid(row=0, column=0, padx=5, sticky=tk.W)
         self.month_var = tk.StringVar()
-        month_combo = ttk.Combobox(controls_frame, textvariable=self.month_var, 
+        month_combo = ttk.Combobox(controls_frame, textvariable=self.month_var,
                                    values=list(self.month_map.keys()), state='readonly')
         month_combo.grid(row=0, column=1, sticky=tk.EW, padx=5)
-        month_combo.set(datetime.now().strftime('%B')) # Default to current month
+        month_combo.set(datetime.now().strftime('%B'))  # Default to current month
         month_combo.bind('<<ComboboxSelected>>', self.on_selection_change)
 
         # Year Selector
         ttk.Label(controls_frame, text="Year:").grid(row=0, column=2, padx=(20, 5), sticky=tk.W)
         self.year_var = tk.StringVar()
         current_year = datetime.now().year
-        years = [str(y) for y in range(current_year, current_year + 6)] # 5 years back, 1 year future
+
+        # --- MODIFIED RANGE: Starts from Last Year (2025) ---
+        # range(start, stop) -> start is inclusive, stop is exclusive
+        # This gives: [current_year - 1, current_year, ... +4 more]
+        years = [str(y) for y in range(current_year - 1, current_year + 6)]
+
         year_combo = ttk.Combobox(controls_frame, textvariable=self.year_var, values=years, state='readonly')
         year_combo.grid(row=0, column=3, sticky=tk.EW, padx=5)
-        year_combo.set(str(current_year)) # Default to current year
+        year_combo.set(str(current_year))  # Default to current year
         year_combo.bind('<<ComboboxSelected>>', self.on_selection_change)
-        
+
         # Refresh Button
         ttk.Button(controls_frame, text="Refresh", command=self.update_summary).grid(row=0, column=4, padx=(20, 5))
 
-        # --- Results Frame (for labels) ---
+        # --- Results Frame ---
         results_frame = ttk.Frame(summary_frame)
         results_frame.pack(fill=tk.X, pady=(10, 0))
-        results_frame.columnconfigure(0, weight=1) # Center the labels
+        results_frame.columnconfigure(0, weight=1)
 
-        # Labels for displaying amounts
-        self.total_label = ttk.Label(results_frame, text="Total: ₹0.00", 
-                                     style="Total.TLabel", anchor=tk.CENTER)
+        self.total_label = ttk.Label(results_frame, text="Total: ₹0.00", style="Total.TLabel", anchor=tk.CENTER)
         self.total_label.grid(row=0, column=0, pady=5)
-        
-        self.paid_label = ttk.Label(results_frame, text="Paid: ₹0.00", 
-                                    style="Paid.TLabel", anchor=tk.CENTER)
+
+        self.paid_label = ttk.Label(results_frame, text="Paid: ₹0.00", style="Paid.TLabel", anchor=tk.CENTER)
         self.paid_label.grid(row=1, column=0, pady=5)
 
-        self.unpaid_label = ttk.Label(results_frame, text="Unpaid: ₹0.00", 
-                                      style="Unpaid.TLabel", anchor=tk.CENTER)
+        self.unpaid_label = ttk.Label(results_frame, text="Unpaid: ₹0.00", style="Unpaid.TLabel", anchor=tk.CENTER)
         self.unpaid_label.grid(row=2, column=0, pady=5)
 
-        # --- [START] ADD NEW CODE BLOCK ---
-        
         # --- Company Breakdown Table ---
         company_frame = ttk.LabelFrame(self, text="Top Companies by Month", padding=10)
         company_frame.pack(expand=True, fill=tk.BOTH, padx=20, pady=(0, 20))
 
         cols = ("company", "invoices", "paid", "unpaid", "total")
-        self.company_tree = ttk.Treeview(company_frame, columns=cols, show="headings", height=6) # 5 Top + 1 Others
-        
-        # Headings
+        self.company_tree = ttk.Treeview(company_frame, columns=cols, show="headings", height=6)
+
         self.company_tree.heading("company", text="Company")
         self.company_tree.heading("invoices", text="No. of Invoices")
         self.company_tree.heading("paid", text="Paid Amount")
         self.company_tree.heading("unpaid", text="Unpaid Amount")
         self.company_tree.heading("total", text="Total")
 
-        # Columns
         self.company_tree.column("company", width=200, anchor=tk.W)
         self.company_tree.column("invoices", width=100, anchor=tk.CENTER)
         self.company_tree.column("paid", width=120, anchor=tk.E)
         self.company_tree.column("unpaid", width=120, anchor=tk.E)
         self.company_tree.column("total", width=120, anchor=tk.E)
-        
-        # Scrollbar
+
         ysb = ttk.Scrollbar(company_frame, orient="vertical", command=self.company_tree.yview)
         self.company_tree.configure(yscrollcommand=ysb.set)
-        
+
         ysb.pack(side=tk.RIGHT, fill=tk.Y)
         self.company_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Add a tag for styling the 'Others' row
+
         self.company_tree.tag_configure('others', font=('Helvetica', 9, 'bold'))
-        # --- [END] ADD NEW CODE BLOCK ---
-        
+
     def on_selection_change(self, event=None):
-        """Called when a combobox is changed."""
         self.update_summary()
 
     def update_summary(self):
-        """Fetches data from the DB and updates the labels."""
         selected_month_name = self.month_var.get()
         selected_year = self.year_var.get()
 
-        if not selected_month_name or not selected_year:
-            return # Don't run if fields are empty
+        if not selected_month_name or not selected_year: return
 
-        # Convert month name (e.g., "October") to number ("10")
         month_num = self.month_map[selected_month_name]
-        
-        # Get data from database
         summary = self.db.get_accounting_summary(month_num, selected_year)
-        
-        # Unpack results, handling None if no records are found
+
         total, paid, unpaid = summary or (None, None, None)
-        
-        # Default to 0.0 if SUM() returns None
         total = total or 0.0
         paid = paid or 0.0
         unpaid = unpaid or 0.0
 
-        # Update the labels using the format_currency function
         self.total_label.config(text=f"Total: {format_currency(total)}")
         self.paid_label.config(text=f"Paid: {format_currency(paid)}")
         self.unpaid_label.config(text=f"Unpaid: {format_currency(unpaid)}")
+
         company_data = self.db.get_company_summary_by_month(month_num, selected_year)
         self._update_company_table(company_data)
-        
+
     def _update_company_table(self, company_data):
-        """Processes and displays the company breakdown in the Treeview."""
-        
-        # Clear existing data
         for i in self.company_tree.get_children():
             self.company_tree.delete(i)
-            
-        if not company_data:
-            return # Nothing to show
 
-        # Initialize totals for the 'Others' group
+        if not company_data: return
+
         others_invoices = 0
         others_paid = 0.0
         others_unpaid = 0.0
         others_total = 0.0
 
         for i, row in enumerate(company_data):
-            # row = (name, count, paid, unpaid, total)
-            # Unpack, handling potential None from SUM
             name = row[0]
             invoices = row[1] or 0
             paid = row[2] or 0.0
@@ -2341,34 +2871,18 @@ class DashboardPage(ttk.Frame):
             total = row[4] or 0.0
 
             if i < 5:
-                # Top 5: Insert directly
-                formatted_row = (
-                    name,
-                    invoices,
-                    format_currency(paid),
-                    format_currency(unpaid),
-                    format_currency(total)
-                )
+                formatted_row = (name, invoices, format_currency(paid), format_currency(unpaid), format_currency(total))
                 self.company_tree.insert("", tk.END, values=formatted_row)
             else:
-                # Add to 'Others'
                 others_invoices += invoices
                 others_paid += paid
                 others_unpaid += unpaid
                 others_total += total
-        
-        # After loop, add the 'Others' row if it has data
+
         if others_total > 0:
-            others_row = (
-                "Others",
-                others_invoices,
-                format_currency(others_paid),
-                format_currency(others_unpaid),
-                format_currency(others_total)
-            )
-            # Insert with the 'others' tag to make it bold
+            others_row = ("Others", others_invoices, format_currency(others_paid), format_currency(others_unpaid),
+                          format_currency(others_total))
             self.company_tree.insert("", tk.END, values=others_row, tags=('others',))
-            
 # --- END: Dashboard Page ---
 # --- NEW: Sales Commission Page ---
 class SalesCommissionPage(ttk.Frame):
@@ -3052,113 +3566,98 @@ class AboutPage(ttk.Frame):
             messagebox.showerror("Import Error",
                                  f"An error occurred during import:\n{e}\n\nThe application might be in an unstable state. Please restart it.")
 
+
 class App(tk.Tk):
     def __init__(self, db, db_path):
         super().__init__()
         self.db = db
         self.db_path = db_path
-        self.version = "v1.0.1"
+        self.version = "v1.1.0"
         self.after_idle(self._configure_window)
         self.PASSWORD = "admin123"
         self.accounting_unlocked = False
-        self.commission_unlocked = False 
+        self.commission_unlocked = False
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
         self.notebook.bind("<Button-1>", self.on_tab_click, True)
-        # --- NEW: GLOBAL TREEVIEW STYLE FIX ---
-        # This one-time style config is needed to make row tags (colors) visible
+
+        # Style configuration
         style = ttk.Style()
+        style.configure("Treeview", rowheight=25)
+        style.map('Treeview', background=[('selected', '#0078D7')], foreground=[('selected', '#FFFFFF')])
 
-        # Configure the Treeview style - ONLY set rowheight
-        # This avoids overriding the theme's ability to show tag colors
-        style.configure("Treeview",
-                        rowheight=25
-                        )
-
-        # Make selected rows still look good
-        style.map('Treeview',
-                  background=[('selected', '#0078D7')],
-                  foreground=[('selected', '#FFFFFF')]
-                  )
-        # --- END GLOBAL STYLE FIX ---
-
-        self.dashboard_page = ttk.Frame(self.notebook)
-        # Define ALL page classes BEFORE creating instances
+        # --- INSTANTIATE PAGES ---
         self.dashboard_page = DashboardPage(self.notebook, self.db, self)
+
+        # 1. The NEW Hero Page (Complex Mode)
+        self.hero_order_page = HeroOrderPage(self.notebook, self.db, self)
+
+        # 2. The STANDARD Order Page (Simple Mode)
         self.order_page = OrderPage(self.notebook, self.db, self)
+
         self.history_page = HistoryPage(self.notebook, self.db, self)
         self.nonoem_page = NonOEMOrderPage(self.notebook, self.db, self)
-        # *** Ensure PartRequestPage is defined before this line ***
-        self.part_request_page = PartRequestPage(self.notebook, self.db, self) 
+        self.part_request_page = PartRequestPage(self.notebook, self.db, self)
         self.commission_page = SalesCommissionPage(self.notebook, self.db, self)
         self.commission_history_page = CommissionHistoryPage(self.notebook, self.db, self)
-        self.accounting_page = AccountingPage(self.notebook, self.db, self) 
+        self.accounting_page = AccountingPage(self.notebook, self.db, self)
         self.about_page = AboutPage(self.notebook, self.db, self, self.db_path)
+
+        # --- ADD TABS TO NOTEBOOK ---
         self.notebook.add(self.dashboard_page, text="Dashboard")
+        self.notebook.add(self.hero_order_page, text="Hero Order")
         self.notebook.add(self.order_page, text="Create Order")
         self.notebook.add(self.history_page, text="Order History")
         self.notebook.add(self.nonoem_page, text="Non-OEM Order")
-        self.notebook.add(self.part_request_page, text="Part Request") # Add PartRequestPage tab here
+        self.notebook.add(self.part_request_page, text="Part Request")
         self.notebook.add(self.commission_page, text="Sales Commission")
         self.notebook.add(self.commission_history_page, text="Commission History")
         self.notebook.add(self.accounting_page, text="Accounting")
-        self.notebook.add(self.about_page, text="About") # <-- ADD THIS LINE
+        self.notebook.add(self.about_page, text="About")
 
     def on_tab_click(self, event):
-        """Handle click on a tab, and check password if needed."""
         try:
             clicked_tab_index = self.notebook.index(f"@{event.x},{event.y}")
             tab_text = self.notebook.tab(clicked_tab_index, "text")
         except tk.TclError:
-            return # Not a click on a tab label
-        # --- NEW: Refresh dashboard on click ---
+            return
+
         if tab_text == "Dashboard":
             try:
                 self.dashboard_page.update_summary()
-            except Exception as e:
-                print(f"Failed to refresh dashboard: {e}")
-        # --- END NEW ---
-        # --- Check for Accounting Tab ---
+            except:
+                pass
+
         if tab_text == "Accounting" and not self.accounting_unlocked:
             current_tab = self.notebook.select()
-            password = simpledialog.askstring("Password Required", "Please enter the admin password:", show='*')
+            password = simpledialog.askstring("Password", "Enter admin password:", show='*')
             if password == self.PASSWORD:
                 self.accounting_unlocked = True
             else:
-                if password is not None:
-                    messagebox.showerror("Access Denied", "Incorrect password.")
-                self.notebook.select(current_tab) # Force selection back
-                return "break" # Stop the tab change
-        # --- Check for Commission Tabs ---
-        elif tab_text in ["Sales Commission", "Commission History"] and not self.commission_unlocked:
-             current_tab = self.notebook.select()
-             password = simpledialog.askstring("Password Required", "Please enter the admin password:", show='*')
-             if password == self.PASSWORD:
-                 self.commission_unlocked = True
-             else:
-                 if password is not None:
-                      messagebox.showerror("Access Denied", "Incorrect password.")
-                 self.notebook.select(current_tab) # Force selection back
-                 return "break" # Stop the tab change
+                if password is not None: messagebox.showerror("Denied", "Incorrect password.")
+                self.notebook.select(current_tab);
+                return "break"
 
+        elif tab_text in ["Sales Commission", "Commission History"] and not self.commission_unlocked:
+            current_tab = self.notebook.select()
+            password = simpledialog.askstring("Password", "Enter admin password:", show='*')
+            if password == self.PASSWORD:
+                self.commission_unlocked = True
+            else:
+                if password is not None: messagebox.showerror("Denied", "Incorrect password.")
+                self.notebook.select(current_tab);
+                return "break"
 
     def _configure_window(self):
-        """Sets window title and geometry after initialization."""
         self.title(f"POS for Kabir Auto Parts - {self.version}")
         self.geometry("1200x800")
-
-        # --- ADD THIS BLOCK ---
         try:
-            # Use resource_path to find the icon (for PyInstaller)
-            icon_path = resource_path("icon.png") 
-            # Store on self to prevent garbage collection
-            self.icon = tk.PhotoImage(file=icon_path) 
+            icon_path = resource_path("icon.png")
+            self.icon = tk.PhotoImage(file=icon_path)
             self.iconphoto(True, self.icon)
-        except tk.TclError as e:
-            print(f"Warning: Could not load icon '{icon_path}': {e}")
-        # --- END OF BLOCK ---
-
+        except:
+            pass
 
 if __name__ == "__main__":
     # --- Define a persistent location for the database ---
@@ -3184,18 +3683,15 @@ if __name__ == "__main__":
             # If copying fails, just print a warning and continue. Don't crash.
             print(f"Warning: Could not copy bundled DB ({e}). Continuing with fresh DB.")
 
+    threading.Thread(target=init_browser_thread, daemon=True).start()
+
     # --- Always use the persistent database path ---
     try:
-        # Pass the PERSISTENT path to the Database and App classes
         db_instance = Database(persistent_db_path)
         app = App(db_instance, persistent_db_path)
         app.mainloop()
     except Exception as e:
-        # General error handling during app startup
-        root = tk.Tk()
+        root = tk.Tk();
         root.withdraw()
-        messagebox.showerror(
-            "Application Error",
-            f"An unexpected error occurred during startup:\n{e}"
-        )
+        messagebox.showerror("Application Error", f"An unexpected error occurred:\n{e}")
         sys.exit(1)
